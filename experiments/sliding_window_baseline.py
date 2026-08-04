@@ -30,15 +30,7 @@ def is_allowed(user_id):
 
 user = "alice"
 
-# Test - 2  (Fixed-window-2 resolved)
 print("--- Batch 1 ---")
-for i in range(5):
-    allowed = is_allowed(user)
-    print(f"Request {i+1}: {'✅ allowed' if allowed else '❌ blocked'}")
-
-time.sleep(1)
-
-print("--- Batch 2 ---")
-for i in range(5):
+for i in range(8):
     allowed = is_allowed(user)
     print(f"Request {i+1}: {'✅ allowed' if allowed else '❌ blocked'}")
