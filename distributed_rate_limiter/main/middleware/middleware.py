@@ -17,7 +17,7 @@ class RateLimitMiddleware:
                 "detail": "Rate limit exceeded. Try again later." 
             }, status=429)
 
-        response = self.get_reponse(request)
+        response = self.get_response(request)
 
         return response
     
