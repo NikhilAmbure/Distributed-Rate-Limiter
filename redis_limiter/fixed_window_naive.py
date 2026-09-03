@@ -36,3 +36,8 @@ for i in range(8):
 
 # same as before, first 5 allowed, 
 # last 3 blocked — just now backed by Redis instead of a dictionary.
+
+# --------------------------------------
+# If you run this script multiple times, you'll see the counter persists across runs,
+# because Redis is a separate process that keeps its own state.
+# -------------------------------------

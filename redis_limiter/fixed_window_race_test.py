@@ -40,7 +40,7 @@ def make_request(user_id, request_num):
 # Fire 20 requests, all at essentially the same moment
 threads = []
 for i in range(20):
-    t = threading.Thread(target=make_request, args=("bob", i))
+    t = threading.Thread(target=make_request, args=("tom", i))
     threads.append(t)
 
 for t in threads:
