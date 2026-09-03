@@ -1,7 +1,11 @@
 import redis
 import time
+import os
 
-r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 LIMIT = 5
 WINDOW_SIZE = 60

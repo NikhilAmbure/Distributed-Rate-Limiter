@@ -1,0 +1,7 @@
+asgiref==3.12.1
+Django==6.1
+django-redis==7.0.0
+djangorestframework==3.18.0
+gunicorn==26.2.0
+redis==8.1.0
+sqlparse==0.6.0
