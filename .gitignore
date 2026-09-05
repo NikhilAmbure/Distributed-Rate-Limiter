@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .git/
 db.sqlite3
+notes.txt

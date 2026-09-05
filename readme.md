@@ -427,8 +427,8 @@ Distributed-Rate-Limiter/
 │
 ├── experiments/                         # Phase A: Algorithms in plain Python
 │   ├── notes/                           # Algorithm explanations
-│   ├── fixed_window_baseline.py
-│   ├── fixed_window_exploit.py
+│   ├── Fixed_window_baseline.py
+│   ├── Fixed_window_exploit.py
 │   ├── sliding_window_baseline.py
 │   ├── sliding_window_full_gap.py
 │   ├── sliding_window_partial_gap.py
@@ -503,8 +503,8 @@ pip install -r distributed_rate_limiter/requirements.txt
 Run the fixed-window experiments:
 
 ```bash
-python experiments/fixed_window_baseline.py
-python experiments/fixed_window_exploit.py
+python experiments/Fixed_window_baseline.py
+python experiments/Fixed_window_exploit.py
 ```
 
 Run the sliding-window experiments:
