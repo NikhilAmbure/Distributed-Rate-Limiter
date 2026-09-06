@@ -1,4 +1,4 @@
-from .fixed_window_atomic import is_allowed
+from .ratelimiter import is_allowed
 from django.http import JsonResponse
 
 class RateLimitMiddleware:

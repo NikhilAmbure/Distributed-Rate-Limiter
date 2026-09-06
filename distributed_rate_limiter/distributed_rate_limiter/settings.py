@@ -129,3 +129,18 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+
+# RATE LIMITER SETTINGS
+
+# SELECT ALGORITHM : 'fixed_window' or 'sliding_window' or 'token_bucket'
+RATE_LIMIT_ALGORITHM = 'fixed_window'
+
+# Used by fixed_window and sliding_window
+RATE_LIMIT_MAX_REQUESTS = 5  # max requests allowed per window
+RATE_LIMIT_WINDOW = 60  # window_size, in seconds
+
+
+# Used by token_bucket only
+RATE_LIMIT_BUCKET_CAPACITY = 5   # max burst size (tokens the bucket can hold)
+RATE_LIMIT_REFILL_RATE = 0.5 
