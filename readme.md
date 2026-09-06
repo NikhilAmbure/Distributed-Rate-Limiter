@@ -45,21 +45,19 @@ Verify global rate limit under concurrency
 
 ---
 
-# 🚦 Rate-Limiting Algorithms
+## 🚦 Rate-Limiting Algorithms
 
-Three algorithms are being explored.
+Three algorithms are implemented and compared, each carried through every phase of the project.
 
 | Algorithm      | Plain Python | Redis | Django | Distributed |
 | -------------- | -----------: | ----: | -----: | ----------: |
 | Fixed Window   |            ✅ |     ✅ |      ✅ |           ✅ |
-| Sliding Window |            ✅ |     ⏳ |      ⏳ |           ⏳ |
-| Token Bucket   |            ✅ |     ⏳ |      ⏳ |           ⏳ |
+| Sliding Window |            ✅ |     ✅ |      ✅ |           ⏳ |
+| Token Bucket   |            ✅ |     ✅ |      ✅ |           ⏳ |
 
 ### 1. Fixed Window
 
 Counts requests within fixed time intervals.
-
-Example:
 
 ```text
 Limit: 5 requests / 60 seconds
@@ -68,7 +66,7 @@ Limit: 5 requests / 60 seconds
       maximum 5 requests
 ```
 
-The implementation demonstrates the **boundary exploit** where requests can be concentrated around a window boundary:
+Vulnerable to a **boundary exploit** — requests concentrated around a window boundary can get up to 2x the intended limit through:
 
 ```text
 Previous window       New window
@@ -79,24 +77,16 @@ Previous window       New window
 ──────────────┬──────────────────────
               │
           boundary
-              
+
 Potentially 10 requests in a short period
 despite a configured limit of 5.
 ```
 
-The algorithm was first implemented in plain Python and then migrated to Redis.
-
-See:
-
-`experiments/notes/fixed-window.md`
-
----
+Full write-up: [`experiments/notes/fixed-window.md`](experiments/notes/fixed-window.md)
 
 ### 2. Sliding Window
 
-Instead of resetting a counter at fixed boundaries, the sliding-window implementation tracks request timestamps over a rolling time period.
-
-This avoids the fixed-window boundary exploit.
+Tracks request timestamps over a rolling time period instead of resetting at fixed boundaries — closing the fixed-window boundary exploit.
 
 ```text
 Current time
@@ -109,23 +99,11 @@ Current time
          the rolling window count
 ```
 
-Implemented and verified in plain Python.
-
-Redis migration is planned.
-
-See:
-
-`experiments/notes/sliding_window.md`
-
----
+Full write-up: [`experiments/notes/sliding_window.md`](experiments/notes/sliding_window.md)
 
 ### 3. Token Bucket
 
-The token bucket algorithm maintains a bucket of tokens that continuously refills over time.
-
-Each request consumes a token.
-
-This allows controlled bursts while maintaining an average request rate.
+Maintains a bucket of tokens that continuously refills over time. Each request consumes a token — this allows controlled bursts while maintaining an average sustained rate, rather than a strict cap.
 
 ```text
         Token refill
@@ -141,127 +119,98 @@ This allows controlled bursts while maintaining an average request rate.
            token
 ```
 
-Implemented and verified in plain Python.
+Unlike fixed/sliding window, `capacity` (burst size) and `refill_rate` (sustained rate) are independent knobs — this is what real APIs (AWS, Stripe, GitHub) tend to use in production, since it tolerates legitimate bursty traffic (e.g. a page load firing several calls at once) without punishing normal usage.
 
-Redis migration is planned.
-
-See:
-
-`experiments/notes/token-bucket.md`
+Full write-up: [`experiments/notes/token-bucket.md`](experiments/notes/token-bucket.md)
 
 ---
 
-# 🐛 The Race Condition
+## ⚖️ When to Use Which Algorithm
 
-The most important part of the project is demonstrating why a naive Redis implementation is not enough.
+Building all three revealed that they aren't interchangeable — each has a different failure mode and a different real-world fit.
 
-### Naive implementation
+| | Fixed Window | Sliding Window | Token Bucket |
+|---|---|---|---|
+| **Memory cost** | Lowest — one counter per user | Higher — one entry per request until it ages out | Low — two fields per user |
+| **Precision** | Weak — vulnerable to a boundary exploit | Strong — no exploitable boundary | Strong for average rate, allows deliberate bursts |
+| **Compute cost per request** | Cheapest (`INCR`) | More expensive (`ZREMRANGEBYSCORE` + `ZCARD` + `ZADD`) | Cheap (fractional math + `HSET`) |
+| **Predictability for callers** | Simple to explain ("resets every N seconds") | Less intuitive ("rolling window") | Two numbers to reason about (burst + refill rate) |
+| **Best suited for** | High-volume, low-stakes limits where simplicity matters more than precision | Security-sensitive limits (login attempts, password resets) where timing exploits are a real concern | General-purpose public APIs that need to tolerate legitimate bursty traffic |
 
-The naive implementation performs:
+### The boundary exploit is an algorithm limitation, not a concurrency bug
 
-```text
-READ count
-     ↓
-CHECK limit
-     ↓
-INCREMENT count
-     ↓
-SET expiry
-```
+An important distinction this project surfaced: the atomic Lua fix eliminates the **race condition** (concurrent requests over-admitting *within* a single key), but it does **not** eliminate fixed window's **boundary exploit** (requests timed around a window's edge getting up to 2x the limit through). These are two separate problems:
 
-These operations are performed separately.
+- The **race condition** is a bug in *how* the check-then-act sequence was implemented — fixed by atomicity, regardless of algorithm.
+- The **boundary exploit** is a property of fixed window's *design* — it uses a different Redis key for each window number, so atomicity correctly protects each key in isolation, but has no way to relate two different keys to each other. No amount of atomicity fixes this; only switching to an algorithm that doesn't rely on window-number-based keys (i.e. sliding window) does.
 
-Under concurrent requests, multiple workers can observe the same count before another worker increments it.
+This is why, even with a fully atomic, race-condition-free fixed window implementation, sending 5 requests at `:59` and 5 more at `:01` of the next window still lets all 10 through — confirmed by testing both the plain-Python version ([`experiments/notes/fixed-window.md`](experiments/notes/fixed-window.md)) and the Redis-backed atomic version.
 
-For example:
+### Why production APIs often use token bucket
 
-```text
-Limit = 5
-
-Request A ──┐
-Request B ──┤
-Request C ──┤──→ READ count = 4
-Request D ──┤
-Request E ──┘
-
-Multiple requests see the same state
-before the counter is updated.
-```
-
-### Race condition reproduced
-
-A concurrent test firing **20 requests** against a limit of **5** produced:
-
-| Implementation | Allowed | Expected |
-| -------------- | ------: | -------: |
-| Naive          |   **7** |        5 |
-| Atomic         |   **5** |        5 |
-
-The bug was reproducible under concurrent load.
+Real traffic is rarely steady — a single page load might legitimately fire 10 API calls at once, then go quiet for 30 seconds. Fixed and sliding window would both reject that burst outright. Token bucket tolerates it: as long as tokens have accumulated during idle time, a burst is allowed, while the *sustained* rate is still capped by the refill rate. This is the same reasoning behind how AWS, Stripe, and GitHub document their own API rate limits — in terms of burst capacity and steady-state rate, not a rigid per-second cutoff.
 
 ---
 
-# ⚛️ Atomic Redis Fix
+## 🐛 The Race Condition
 
-The race condition was fixed by moving the complete operation into a single Redis Lua script.
+The most important part of the project: demonstrating why a naive Redis implementation isn't enough, for *any* of the three algorithms.
 
-Instead of:
+### The naive pattern
 
 ```text
-READ
- ↓
-CHECK
- ↓
-INCREMENT
- ↓
-EXPIRE
+READ current state
+     ↓
+CHECK against limit
+     ↓
+WRITE updated state
 ```
 
-the entire operation becomes one atomic Redis execution:
+These are separate Redis calls. Under concurrent requests, multiple workers can read the same stale state before any of them writes back.
+
+### Reproduced with a concurrency test (20 requests, limit/capacity = 5)
+
+| Algorithm      | Naive (allowed) | Atomic (allowed) | Bug type |
+| -------------- | ---------------: | ----------------: | -------- |
+| Fixed Window   |                7 |                  5 | Stale read feeding an incorrect check |
+| Sliding Window |                6 |                  5 | Same as above, narrower window |
+| Token Bucket   |               17 |                  5 | **Lost update** — concurrent writes overwrite instead of accumulating |
+
+Token bucket's naive bug is meaningfully worse than the other two: each thread independently computes a brand-new token value and overwrites the previous thread's write, rather than each decrement correctly stacking. Full explanation: [`redis_limiter/README.md`](redis_limiter/README.md)
+
+---
+
+## ⚛️ The Fix: Atomic Redis Lua Scripting
+
+Each algorithm's full read-check-write sequence is moved into a single Redis Lua script, executed atomically — no other client's commands can interleave mid-script.
 
 ```text
 ┌─────────────────────────────┐
 │       Redis Lua Script      │
-│                             │
-│  Read → Check → Increment   │
-│         → Expire            │
-│                             │
-└──────────────┬──────────────┘
+│                              │
+│  Read → Check → Update      │
+│                              │
+└──────────────┬───────────────┘
                ↓
         Atomic execution
 ```
 
-Redis executes the Lua script atomically, preventing other commands from interleaving with the rate-limit operation.
-
-The same concurrent test now consistently produces:
-
-```text
-20 concurrent requests
-        ↓
-Limit = 5
-        ↓
-Allowed: 5
-Blocked: 15
-```
-
-Implementation:
-
-`redis_limiter/fixed_window_atomic.py`
+All three algorithms now consistently enforce their configured limit under concurrent load. Full implementations and write-ups: [`redis_limiter/`](redis_limiter/)
 
 ---
 
-# 🌐 Django Integration
+## 🌐 Django Integration
 
-The atomic fixed-window limiter is integrated into Django as middleware.
-
-### Request flow
+All three atomic algorithms are wired into Django as a single, configurable middleware — switch algorithms via one setting, no code changes required.
 
 ```text
 HTTP Request
      ↓
 RateLimitMiddleware
      ↓
-Identify client
+Identify client (IP)
+     ↓
+Dispatch to configured algorithm
      ↓
 Redis Lua script
      ↓
@@ -279,48 +228,13 @@ Redis Lua script
   View
 ```
 
-The middleware:
-
-* Runs early in the Django middleware stack.
-* Identifies clients using their IP address.
-* Checks `X-Forwarded-For` first.
-* Falls back to `REMOTE_ADDR`.
-* Uses the same atomic `is_allowed()` implementation.
-* Returns `429 Too Many Requests` when the limit is exceeded.
-* Prevents the Django view from executing when the request is blocked.
-
-Current configuration:
-
-```text
-Limit: 5 requests
-Window: 60 seconds
-Scope: Global
-Identifier: Client IP
-```
-
-Test endpoint:
-
-```text
-GET /api/hello/
-```
-
-Middleware:
-
-`distributed_rate_limiter/main/middleware/middleware.py`
+Full details on the middleware architecture, configuration, and Docker/distributed setup: **[`distributed_rate_limiter/README.md`](distributed_rate_limiter/README.md)**
 
 ---
 
-# 🌍 Distributed Deployment
+## 🌍 Distributed Deployment
 
-A single Django instance sharing Redis demonstrates that the atomic algorithm works.
-
-However, that isn't enough to prove the system is actually distributed.
-
-The real test is:
-
-> Does the same global limit hold when requests are handled by multiple independent application servers?
-
-The project uses Docker Compose to run:
+Docker Compose runs 3 Django instances behind Nginx (round-robin), all sharing one Redis backend — proving the rate limit holds **globally across the cluster**, not just within a single process.
 
 ```text
                   ┌──────────────┐
@@ -334,7 +248,6 @@ The project uses Docker Compose to run:
           ↓              ↓              ↓
      ┌─────────┐    ┌─────────┐    ┌─────────┐
      │ Django 1│    │ Django 2│    │ Django 3│
-     │ Gunicorn│    │ Gunicorn│    │ Gunicorn│
      └────┬────┘    └────┬────┘    └────┬────┘
           │              │              │
           └──────────────┼──────────────┘
@@ -345,112 +258,40 @@ The project uses Docker Compose to run:
                   └─────────────┘
 ```
 
-### Why shared Redis matters
-
-If each Django instance maintained its own in-memory counter:
-
-```text
-Client
-  ↓
-Nginx
-  ├── Django 1 → counter = 5
-  ├── Django 2 → counter = 5
-  └── Django 3 → counter = 5
-```
-
-A client could potentially make significantly more requests than the configured limit because each instance would maintain independent state.
-
-With shared Redis:
-
-```text
-Django 1 ──┐
-Django 2 ──┼──→ Redis
-Django 3 ──┘
-```
-
-All instances operate against the same atomic counter.
-
-The limit is therefore enforced **globally across the application cluster**.
-
----
-
-# 🧪 Distributed Concurrent Test
-
-The distributed test sends **20 concurrent requests** through Nginx:
-
-```text
-20 concurrent requests
-          ↓
-        Nginx
-          ↓
- Django 1 / Django 2 / Django 3
-          ↓
-     Shared Redis
-```
-
-### Run 1 — Fresh Window
+**Verified with an automated concurrent load test** (20 requests through Nginx, fixed window, limit=5):
 
 ```text
 Allowed: 5
 Blocked: 15
 ```
 
-The configured limit is correctly enforced across all three Django instances combined.
-
-### Run 2 — Same Window
-
-Running the test again immediately:
-
-```text
-Allowed: 0
-Blocked: 20
-```
-
-This confirms that the limit is stored globally in Redis rather than independently inside each Django process.
-
-Docker logs also confirm that requests were distributed across:
-
-```text
-django1
-django2
-django3
-```
-
-while the combined number of allowed requests never exceeded the configured limit.
+Full setup, config, and running instructions: **[`distributed_rate_limiter/README.md`](distributed_rate_limiter/README.md)**
 
 ---
 
-# 📁 Project Structure
+## 📁 Project Structure
 
 ```text
 Distributed-Rate-Limiter/
 │
-├── experiments/                         # Phase A: Algorithms in plain Python
-│   ├── notes/                           # Algorithm explanations
-│   ├── Fixed_window_baseline.py
-│   ├── Fixed_window_exploit.py
-│   ├── sliding_window_baseline.py
-│   ├── sliding_window_full_gap.py
-│   ├── sliding_window_partial_gap.py
-│   ├── token_bucket_baseline.py
-│   └── token_bucket_refill.py
+├── experiments/                    # A: algorithms in plain Python
+│   └── notes/                       # write-ups per algorithm
 │
-├── redis_limiter/                       # Phase B: Redis implementation
-│   ├── fixed_window_naive.py            # Non-atomic implementation
-│   ├── fixed_window_race_test.py        # Reproduces race condition
-│   └── fixed_window_atomic.py           # Atomic Lua implementation
+├── redis_limiter/                   # B: Redis-backed algorithms
+│   ├── README.md                    # naive → race condition → atomic fix, all 3 algorithms
+│   ├── fixed_window_*.py
+│   ├── sliding_window_*.py
+│   └── token_bucket_*.py
 │
-├── load_tests/                          # Phase D: Distributed testing
+├── load_tests/                      # D: distributed concurrent test
 │   └── distributed_race_test.py
 │
-├── distributed_rate_limiter/            # Phase C/D: Django application
-│   │
-│   ├── distributed_rate_limiter/        # Django project configuration
-│   ├── main/                            # Application logic & middleware
-│   ├── nginx/                           # Nginx configuration
+├── distributed_rate_limiter/        # C/D: Django project + Docker setup
+│   ├── README.md                    # middleware, config, Docker, distributed details
+│   ├── main/                        # views, middleware, ratelimiter dispatcher
+│   ├── nginx/                       # load balancer config
 │   ├── Dockerfile
 │   ├── docker-compose.yml
-│   ├── requirements.txt
 │   └── manage.py
 │
 └── README.md
@@ -458,7 +299,7 @@ Distributed-Rate-Limiter/
 
 ---
 
-# 🛠️ Tech Stack
+## 🛠️ Tech Stack
 
 | Technology         | Purpose                                      |
 | ------------------ | -------------------------------------------- |
@@ -470,231 +311,60 @@ Distributed-Rate-Limiter/
 | **Docker Compose** | Multi-container distributed setup            |
 | **Nginx**          | Reverse proxy and round-robin load balancing |
 | **Gunicorn**       | Production WSGI server                       |
-| **Requests**       | Concurrent HTTP load testing                 |
 
 ---
 
-# 🚀 Running the Project
-
-## Prerequisites
-
-* Python 3.x
-* Docker
-* Docker Compose
-* Git
-
----
-
-## Phase A — Plain Python Algorithms
-
-Clone the repository:
+## 🚀 Quick Start
 
 ```bash
 git clone https://github.com/NikhilAmbure/Distributed-Rate-Limiter.git
 cd Distributed-Rate-Limiter
-```
 
-Install dependencies:
-
-```bash
-pip install -r distributed_rate_limiter/requirements.txt
-```
-
-Run the fixed-window experiments:
-
-```bash
+# Phase A/B — algorithms + Redis, standalone
+pip install -r requirements.txt
 python experiments/Fixed_window_baseline.py
-python experiments/Fixed_window_exploit.py
-```
-
-Run the sliding-window experiments:
-
-```bash
-python experiments/sliding_window_baseline.py
-python experiments/sliding_window_full_gap.py
-python experiments/sliding_window_partial_gap.py
-```
-
-Run the token-bucket experiments:
-
-```bash
-python experiments/token_bucket_baseline.py
-python experiments/token_bucket_refill.py
-```
-
----
-
-## Phase B — Redis Implementation
-
-Start Redis:
-
-```bash
-docker run -d \
-  --name redis-ratelimiter \
-  -p 6379:6379 \
-  redis
-```
-
-Run the naive implementation:
-
-```bash
-python redis_limiter/fixed_window_naive.py
-```
-
-Reproduce the race condition:
-
-```bash
-python redis_limiter/fixed_window_race_test.py
-```
-
-Run the atomic implementation:
-
-```bash
+docker run -d --name redis-ratelimiter -p 6379:6379 redis
 python redis_limiter/fixed_window_atomic.py
-```
 
----
-
-## Phase C/D — Full Distributed Setup
-
-Start the complete environment:
-
-```bash
+# Phase C/D — full Django + Docker distributed setup
 cd distributed_rate_limiter
-
 docker compose up --build
-```
-
-The environment starts:
-
-```text
-Nginx
-Django × 3
-Redis
-```
-
-Test the endpoint:
-
-```bash
 curl -i http://localhost/api/hello/
 ```
 
-Send six sequential requests:
-
-```bash
-for i in {1..6}; do
-    curl -i http://localhost/api/hello/
-done
-```
-
-The first five requests should be allowed and the sixth should return:
-
-```text
-HTTP 429 Too Many Requests
-```
+See [`redis_limiter/README.md`](redis_limiter/README.md) and [`distributed_rate_limiter/README.md`](distributed_rate_limiter/README.md) for detailed, phase-by-phase instructions.
 
 ---
 
-## Run the Distributed Concurrent Test
-
-From the repository root:
-
-```bash
-cd ..
-pip install requests
-python load_tests/distributed_race_test.py
-```
-
-Expected result on a fresh window:
-
-```text
-Allowed: 5
-Blocked: 15
-```
-
-Running it again within the same 60-second window should produce:
-
-```text
-Allowed: 0
-Blocked: 20
-```
-
----
-
-# 📊 Current Status
+## 📊 Current Status
 
 🚧 **In Progress**
 
-### Fixed Window
-
-* ✅ Plain Python implementation
-* ✅ Boundary exploit demonstrated
-* ✅ Redis-backed implementation
-* ✅ Race condition reproduced
-* ✅ Concurrent test created
-* ✅ Atomic Redis Lua implementation
-* ✅ Django middleware integration
-* ✅ Dockerized deployment
-* ✅ 3 Django instances
-* ✅ Nginx round-robin load balancing
-* ✅ Shared Redis state
-* ✅ Distributed concurrent load test
-
-### Sliding Window
-
-* ✅ Plain Python implementation
-* ⏳ Redis implementation
-* ⏳ Race-condition testing
-* ⏳ Atomic implementation
-* ⏳ Django integration
-* ⏳ Distributed verification
-
-### Token Bucket
-
-* ✅ Plain Python implementation
-* ⏳ Redis implementation
-* ⏳ Race-condition testing
-* ⏳ Atomic implementation
-* ⏳ Django integration
-* ⏳ Distributed verification
+* ✅ All three algorithms: plain Python → Redis (naive → race condition → atomic fix)
+* ✅ Django middleware supporting all three algorithms via a single config setting
+* ✅ Dockerized, 3-instance distributed deployment behind Nginx, shared Redis
+* ✅ Automated distributed concurrent load test (fixed window)
+* ⏳ Distributed load test coverage for sliding window and token bucket
+* ⏳ Per-route / per-user configurable limits (currently one global limit)
+* ⏳ Rate-limit response headers (`X-RateLimit-Remaining`, etc.)
+* ⏳ Fail-open/fail-closed behavior if Redis becomes unavailable
 
 ---
 
-# 🔮 Planned Improvements
-
-* Redis implementation of sliding window
-* Redis implementation of token bucket
-* Atomic concurrency handling for all algorithms
-* Per-user rate limits
-* Per-IP rate limits
-* Per-route configuration
-* Configurable limits instead of hardcoded values
-* Algorithm selection
-* Rate-limit response headers
-* Improved observability and metrics
-* Automated CI/CD pipeline
-* Production deployment
-
----
-
-# 📚 What This Project Demonstrates
+## 📚 What This Project Demonstrates
 
 This project is primarily a learning exercise in **distributed systems and concurrency**, rather than an attempt to create a production-ready replacement for established rate-limiting solutions.
 
-The main concepts explored are:
+The main concepts explored:
 
-* Rate-limiting algorithms
-* Concurrency
-* Race conditions
-* Atomic operations
-* Redis scripting
+* Rate-limiting algorithms and their trade-offs
+* Concurrency and race conditions
+* Atomic operations and Redis scripting
 * Distributed shared state
 * Django middleware
-* HTTP `429` responses
-* Reverse proxies
-* Load balancing
+* Reverse proxies and load balancing
 * Docker networking
 * Multi-instance application architecture
 * Concurrent load testing
 
-The goal is to understand **why distributed systems fail under concurrency and how to design them so that correctness is maintained across multiple application instances.**
+The goal is to understand **why distributed systems fail under concurrency, and how to design them so correctness holds across multiple application instances.**
