@@ -320,11 +320,205 @@ the value represents (a request count, an inventory count, an
 account balance, etc.). The fix — atomicity via Lua scripting — is a
 general pattern, not something specific to one algorithm.
 
+
+---
+
+# Token Bucket
+
+## Why a hash
+
+Token bucket needs to track two related pieces of state per user:
+how many tokens are currently available, and when the bucket was
+last refilled. Redis's **hash** data structure is a natural fit — a
+single key holding multiple named fields, similar to a small
+dictionary living inside Redis.
+
+## The naive migration
+
+```python
+def is_allowed(user_id):
+    now = time.time()
+    key = f"bucket:{user_id}"
+
+    data = r.hmget(key, 'tokens', 'last_refill')
+    tokens, last_refill = data
+
+    if tokens is None:
+        tokens = CAPACITY
+        last_refill = now
+    else:
+        tokens = float(tokens)
+        last_refill = float(last_refill)
+
+    elapsed = now - last_refill
+    refill_amount = elapsed * REFILL_RATE
+    tokens = min(CAPACITY, tokens + refill_amount)
+
+    if tokens >= 1:
+        tokens -= 1
+        r.hset(key, mapping={'tokens': tokens, 'last_refill': now})
+        return True
+    else:
+        r.hset(key, mapping={'tokens': tokens, 'last_refill': now})
+        return False
+```
+
+- `HMGET` reads both `tokens` and `last_refill` in one call.
+- The refill math is identical to the Phase A Python version — the
+  only change is reading/writing Redis instead of a dict.
+- Notably, the updated token count is written back **even when the
+  request is blocked** — a blocked request still represents time
+  passing, so the partially-refilled (but insufficient) amount must
+  be persisted, or the next check would miscalculate elapsed time.
+
+Tested with 8 sequential requests: correctly allowed the first 5
+(bucket starts full), blocked the remaining 3. A second run shortly
+after correctly picked up refill from where the bucket left off,
+rather than resetting — confirming persistence works as expected.
+
+See [`token_bucket_naive.py`](token_bucket_naive.py).
+
+## The race condition — a lost update, not just a stale read
+
+Firing 20 concurrent requests against a **fresh** bucket (capacity=5)
+produced:
+
+Allowed: 17
+Blocked: 3
+Capacity was: 5
+
+
+This is a dramatically worse over-admission than fixed window's 7 or
+sliding window's 6 — because the underlying bug here is a different
+and more severe category: a **lost update**, not just a stale read
+feeding a check.
+
+### Why this happens
+
+| Time | Thread A               | Thread B               | Thread C               |
+|------|------------------------|------------------------|------------------------|
+| t1   | HMGET → tokens = 5     |                        |                        |
+| t2   |                        | HMGET → tokens = 5     |                        |
+| t3   |                        |                        | HMGET → tokens = 5     |
+| t4   | computes 5 - 1 = 4     |                        |                        |
+| t5   |                        | computes 5 - 1 = 4     |                        |
+| t6   |                        |                        | computes 5 - 1 = 4     |
+| t7   | HSET tokens = 4        |                        |                        |
+| t8   |                        | HSET tokens = 4        |                        |
+| t9   |                        |                        | HSET tokens = 4        |
+
+All three threads read the same starting value (5), independently
+compute "5 - 1 = 4," and each overwrite the hash with 4 — completely
+unaware of each other's decrements. After all three "requests," the
+stored value is still 4, as if only one request had ever happened,
+even though three were allowed and each thread believed it had
+correctly spent a token.
+
+This differs from fixed/sliding window's race condition: there, the
+*check* used stale data, but each write still correctly accumulated
+(`INCR` and `ZADD` both add relative to existing state). Here, the
+write is **destructive** — each thread computes and writes an
+absolute new value from scratch, so concurrent writes erase each
+other's work instead of stacking. This is why the number of
+over-admitted requests is so much higher.
+
+See [`token_bucket_race_test.py`](token_bucket_race_test.py).
+
+## The fix: atomic Lua scripting
+
+```lua
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local refill_rate = tonumber(ARGV[3])
+
+local data = redis.call('HMGET', key, 'tokens', 'last_refill')
+local tokens = tonumber(data[1])
+local last_refill = tonumber(data[2])
+
+if tokens == nil then
+    tokens = capacity
+    last_refill = now
+end
+
+local elapsed = now - last_refill
+local refill_amount = elapsed * refill_rate
+tokens = math.min(capacity, tokens + refill_amount)
+
+if tokens >= 1 then
+    tokens = tokens - 1
+    redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
+    return 1
+else
+    redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
+    return 0
+end
+```
+
+```python
+rate_limit_script = r.register_script(LUA_SCRIPT)
+
+def is_allowed(user_id):
+    now = time.time()
+    key = f"bucket:{user_id}"
+    result = rate_limit_script(keys=[key], args=[now, CAPACITY, REFILL_RATE])
+    return result == 1
+```
+
+Because the entire read-refill-check-decrement-write sequence now
+executes as one uninterruptible Redis operation, no two threads can
+ever read the same starting token count and independently overwrite
+each other's decrements — each thread's script fully completes,
+write included, before the next thread's script can even begin
+reading.
+
+See [`token_bucket_atomic.py`](token_bucket_atomic.py).
+
+**Verified with the same concurrency test (20 threads, fresh bucket,
+capacity=5):**
+
+Allowed: 5
+Blocked: 15
+Capacity was: 5
+
+
+A follow-up run in the same window correctly allowed only 1 request
+— consistent with token bucket's gradual refill behavior, since a
+small amount of real time had passed and refilled just over one
+token's worth, unlike fixed/sliding window's all-or-nothing reset.
+
+## Results summary
+
+| Version | 20 concurrent requests, fresh bucket (capacity=5) | Enforces limit correctly? |
+|---|---|---|
+| Naive (HMGET → compute → HSET as separate steps) | 17 allowed | ❌ No |
+| Atomic (single Lua script) | 5 allowed | ✅ Yes |
+
+---
+
+## Key takeaway
+
+None of the three rate-limiting *algorithms* are wrong on their own
+— fixed window, sliding window, and token bucket all correctly
+implement their intended logic in isolation. The bug in every case
+is in **how the check and the update are executed against shared
+state**. Any naive "read, then decide, then write" pattern against a
+value multiple processes can touch concurrently is vulnerable to a
+race condition — though the exact failure mode can differ. Fixed and
+sliding window suffer from stale reads feeding an incorrect check,
+while still writing correctly (7 and 6 over-admitted, respectively).
+Token bucket suffers from something worse — a lost update, where
+concurrent writes overwrite rather than accumulate, leading to a
+much larger over-admission (17). In all three cases, the fix is the
+same general pattern: atomicity via Lua scripting, ensuring the
+entire read-check-write sequence executes as one uninterruptible
+unit, regardless of the underlying data structure or what the value
+represents.
+
 ## Next steps
 
-- Migrate token bucket to Redis using the same naive → race test →
-  atomic fix pattern (via a Redis hash storing `tokens` and
-  `last_refill`)
 - Extend the Django middleware to support choosing between fixed
   window / sliding window / token bucket, instead of hardcoding
   fixed window
+- Make limits/windows configurable per route or per user, instead of
+  one global hardcoded limit
